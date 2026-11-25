@@ -417,6 +417,98 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
 }
 
+/// `buffer_store_dword vdata, v6, s[8:11], 0 offen offset:byte_off`.
+const fn store_at_v6(vdata: u32, byte_off: u32) -> [u32; 2] {
+    [0x38 << 26 | 0x1C << 18 | 1 << 12 | byte_off, 0x80 << 24 | 2 << 16 | vdata << 8 | 6]
+}
+
+/// Runs `native` (lowered for a host of 32-lane waves) once on the hardware device and gives
+/// `dwords` dwords of the UAV; None (and a line) without such a device.
+fn dwords_on_the_card(native: &NativeProgram, dwords: u32) -> Option<Vec<u32>> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("compute_pipeline failed: {e}"));
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let mut out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out.swap_remove(0))
+}
+
+/// Two `ds_permute_b32` in a row, each lane's data its thread index plus 0x100. The first, with
+/// all lanes, reverses the lanes of each half and shifts them by one with `offset:4`. The
+/// second runs with the lanes below 16 of each half: they give to the even lanes. The other
+/// lanes name the odd lanes, but they are not in EXEC, so the odd lanes read zero (not what
+/// the first permute left), and the other lanes keep their v1. Console waves of 32 (one, then
+/// two in a group) and console waves of 64 run as two host waves of 32 (one, then two).
+#[test]
+fn a_scatter_permute_gives_each_named_lane_the_senders_value() {
+    for (wave64, threads) in [(false, 32u32), (false, 64), (true, 64), (true, 128)] {
+        let restore_exec = if wave64 { 0xBEFE_04C1 } else { 0xBEFE_03C1 };
+        let mut words = vec![
+            0x340C_0082, // v_lshlrev_b32 v6, 2, v0: where this thread stores
+            0x4A04_00FF,
+            0x0000_0100, // v_add_nc_u32 v2, 0x100, v0: the data
+            0x3A06_009F, // v_xor_b32 v3, 31, v0
+            0x3406_0682, // v_lshlrev_b32 v3, 2, v3: the first addresses
+            0x2C0A_0084, // v_lshrrev_b32 v5, 4, v0
+            0x360A_0A81, // v_and_b32 v5, 1, v5
+            0x3408_0081, // v_lshlrev_b32 v4, 1, v0
+            0x380A_0B04, // v_or_b32 v5, v4, v5
+            0x340A_0A82, // v_lshlrev_b32 v5, 2, v5: the second addresses
+            0x3608_009F, // v_and_b32 v4, 31, v0
+            0xDAC8_0004,
+            0x0100_0203, // ds_permute_b32 v1, v3, v2 offset:4
+        ];
+        words.extend(store_at_v6(1, 0));
+        words.extend([
+            0x7DA8_0890, // v_cmpx_gt_u32 16, v4
+            0xDAC8_0000,
+            0x0100_0205, // ds_permute_b32 v1, v5, v2
+            restore_exec,
+        ]);
+        words.extend(store_at_v6(1, 4 * threads));
+        let native = native_of(&words, wave64, threads);
+        let Some(got) = dwords_on_the_card(&native, 2 * threads) else { return };
+        for t in 0..threads {
+            let (half, lane) = (t & !31, t & 31);
+            let first = 0x100 + half + ((32 - lane) & 31);
+            assert_eq!(got[t as usize], first, "wave64 {wave64}, {threads} threads: thread {t}, all lanes");
+            let second = match lane {
+                16.. => first,
+                _ if lane % 2 == 0 => 0x100 + half + lane / 2,
+                _ => 0,
+            };
+            assert_eq!(
+                got[(threads + t) as usize],
+                second,
+                "wave64 {wave64}, {threads} threads: thread {t}, the lanes below 16"
+            );
+        }
+        eprintln!("ran on the hardware device: the scatter, wave64 {wave64}, {threads} threads");
+    }
+}
+
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {

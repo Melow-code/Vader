@@ -265,6 +265,9 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// The first dword of the scatter's scratch, a dword per lane of every console wave in the
+    /// group (`ds_permute_b32`), allocated past the program's LDS.
+    scatter: Option<u32>,
     wave_base: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
@@ -1272,6 +1275,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // the scatter's scratch base (`ds_permute_b32`)
+        let mut scatter: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1398,6 +1403,17 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+            }
+            // The scatter's scratch (`ds_permute_b32`): a dword per lane of
+            // every console wave in the group, past everything else's LDS.
+            // Addressed by the console thread, so the two host waves of a
+            // split console wave never hit the same slot, and a lane names
+            // its own half. (The zero-initialized `tmp` of the ISA's
+            // ds_permute_b32; see its lowering in `ds`.)
+            if insts().any(|i| i.name() == "ds_permute_b32") {
+                scatter = Some(s.lds_dwords);
+                let group = cs.threads.iter().product::<u32>();
+                s.lds_dwords += 64 * group.div_ceil(64);
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1558,6 +1574,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            scatter,
             wave_base: None,
             flat: None,
             no_barrier,
@@ -4455,6 +4472,65 @@ impl<'a> Lower<'a> {
             };
             let r = self.read_lane(x, src);
             let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
+        if name == "ds_permute_b32" {
+            // A scatter: each lane in EXEC gives its data register to the
+            // lane its address plus the offset names in dwords, within the
+            // calling lane's 32-lane half. An active lane that no lane names
+            // reads zero. The lowering zeroes the calling lane's slot of a
+            // scratch, runs a group barrier, has each lane in EXEC write the
+            // slot its address names, runs another barrier, and reads the
+            // calling lane's slot. A barrier needs every lane: in a block
+            // some lanes leave, this refuses (a wave-wide structuring of the
+            // block would open it).
+            // shortcut: the barriers are the group's. In a group of several
+            // console waves, a branch on a scalar that only some waves take
+            // around this instruction would leave the others waiting.
+            self.cross_lane(false)?;
+            let every = if self.exchange.is_some() {
+                self.all_lanes(self.cur_ir)
+            } else {
+                all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
+            };
+            if !every {
+                need(self.cur_ir);
+                return Err("a scatter permute where not every lane runs");
+            }
+            let scatter = self.scatter.ok_or("a scatter permute outside compute")?;
+            let x = self.vgprs(inst, data.first().ok_or("a scatter source")?, 1)?[0];
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a scatter address")?, 1)?[0];
+            let o = self.s.m.i32(offset);
+            let bytes = self.s.m.bin(c, Bin::Add, a, o);
+            let two = self.s.m.i32(2);
+            let idx = self.s.m.bin(c, Bin::LShr, bytes, two);
+            let k31 = self.s.m.i32(31);
+            let idx = self.s.m.bin(c, Bin::And, idx, k31);
+            // The scratch is addressed by the console thread: every console
+            // wave of the group owns 64 consecutive dwords, so the two host
+            // waves of a split console wave never hit the same slot, and a
+            // lane names its own half.
+            let thread = self.console_thread();
+            let not31 = self.s.m.i32(!31);
+            let half = self.s.m.bin(c, Bin::And, thread, not31);
+            let named = self.s.m.bin(c, Bin::Or, half, idx);
+            let lds = self.s.lds();
+            let k = self.s.m.i32(scatter);
+            let mine = self.s.m.bin(c, Bin::Add, k, thread);
+            let named = self.s.m.bin(c, Bin::Add, k, named);
+            let mine = self.s.m.element(c, lds, mine);
+            let named = self.s.m.element(c, lds, named);
+            let z = self.s.m.i32(0);
+            self.s.m.store(c, mine, z);
+            self.group_sync(self.cur);
+            // Only the lanes in EXEC give their data, as on the console.
+            let at = self.begin_guarded(guard);
+            self.s.m.store(self.cur, named, x);
+            self.end_guarded(at, &[]);
+            self.group_sync(self.cur);
+            let r = self.s.m.load(self.cur, mine);
+            let reg = dst_reg.ok_or("a scatter result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
@@ -11963,5 +12039,46 @@ mod tests {
             Ok(()) => panic!("a read of the carry lowered"),
         };
         assert!(e.contains("a lane mask from a carry is not supported"), "{e}");
+    }
+
+    #[test]
+    fn a_scatter_permute_writes_the_lane_its_address_names() {
+        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2; the result stored
+        // back to LDS so it is read.
+        lowers(
+            &[
+                0x7E04_028B,
+                0xDAC8_0000,
+                0x0100_0200,
+                0xD834_0000, // ds_write_b32 [v0], v1
+                0x0000_0100,
+                S_ENDPGM,
+            ],
+            1 << 15,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_scatter_permute_in_a_branch_is_refused() {
+        // A per-lane branch (each lane takes s_cbranch_vccz on its own
+        // compare bit) around the scatter: some lanes skip the block, and
+        // the scatter's barriers need every lane. The stored result makes
+        // the refusal reach the program.
+        let body = [
+            0x7E04_028B, // v_mov_b32 v2, 11
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBF86_0002, // s_cbranch_vccz 2
+            0xDAC8_0000, // ds_permute_b32 v1, v0, v2
+            0x0100_0200,
+            0xD834_0000, // ds_write_b32 [v0], v1
+            0x0000_0100,
+            S_ENDPGM,
+        ];
+        let e = match lowers(&body, 1 << 15) {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("a scatter permute in a branch lowered"),
+        };
+        assert!(e.contains("a scatter permute"), "{e}");
     }
 }
