@@ -19,14 +19,23 @@ publisher.
 
 ## Status
 
-| Stage | State |
-|---|---|
-| Boot, first-boot screens, intro, opening credits | works |
-| Intro video | video planes restored (GPU-view mirrors) |
-| Prologue | playable from the cell to the boat chase |
-| Stability | 1 h 30 min+ in one session without a crash (upstream) |
-| Frame rate | 1-3 fps in the world on an RTX 3050; see docs/PLAN.md for targets |
-| Known problems | anything in shadow is black; bright scenes overexpose |
+Nothing below is a claim of ours unless it says **verified here**. The rest
+comes from upstream's own reports on their test machine, not from this
+repo's runs.
+
+| Stage | State | Where it was seen |
+|---|---|---|
+| Boot, first-boot screens, intro, opening credits | works | upstream report (RTX 3050) |
+| Intro video | GPU-view mirrors landed; the log shows the pairing (`gpu_view`/`cpu_view`), the picture is not confirmed visually yet | this tree, unverified |
+| Prologue | playable from the cell to the boat chase | upstream report (RTX 3050) |
+| Stability | 1 h 30 min+ in one session without a crash | upstream report |
+| Frame rate | 1-3 fps in the world | upstream report (RTX 3050); see docs/PLAN.md for our targets |
+| Known problems | anything in shadow is black; bright scenes overexpose | upstream report |
+
+**Verified here:** the tree builds, clippy passes with zero warnings, and
+the workspace tests pass on an RTX 2080 Ti. The GPU-view pairing fires at
+runtime (one `gpu_view`/`cpu_view` pair logged). Nothing else has been
+confirmed on this machine yet.
 
 Tested on Windows 11 with an NVIDIA GeForce RTX 3050 (8 GB) by upstream.
 See [docs/upstream-fork-changelog.md](docs/upstream-fork-changelog.md) for
