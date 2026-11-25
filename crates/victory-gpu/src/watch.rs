@@ -642,6 +642,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
+    // A GPU view it touches may read from another address now (its CPU
+    // view, or itself): texture staging re-asks on its generation.
+    crate::mirrors::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.

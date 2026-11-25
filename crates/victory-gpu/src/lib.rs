@@ -49,6 +49,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+pub mod mirrors;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]

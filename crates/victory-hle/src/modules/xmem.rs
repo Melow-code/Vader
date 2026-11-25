@@ -92,6 +92,9 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    // The raw console flags and protection, before the host mask below:
+    // `mirrors` pairs the GPU-only reservations with their CPU views.
+    let (raw_kind, raw_protect) = (kind, protect);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -161,6 +164,9 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if !at.is_null() {
+        victory_gpu::mirrors::reserved(at as usize, size, raw_kind, raw_protect);
     }
     at
 }

@@ -46,6 +46,11 @@ pub(crate) struct Staging {
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
+    /// The address to read the bytes from: `memory`, or its paired CPU
+    /// view when `memory` is a GPU-only view nothing is mapped at (the
+    /// Bink video planes). It changes when the runtime maps the GPU view,
+    /// which bumps [`crate::mirrors::generation`].
+    src: std::sync::atomic::AtomicUsize,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -594,7 +599,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
-        (self.memory as usize, self.layout.size as usize)
+        (
+            self.src.load(std::sync::atomic::Ordering::Relaxed),
+            self.layout.size as usize,
+        )
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -618,9 +626,19 @@ impl Staging {
 
     fn refresh_timed(&self) -> usize {
         let size = self.layout.size as usize;
-        let start = self.memory as usize;
+        // The address to read from: a GPU-only view's paired CPU view while
+        // nothing is mapped at the GPU address. It can change when the
+        // runtime maps or unmaps the GPU view (`crate::mirrors`); then what
+        // was learnt of it is forgotten.
+        let src = source_address(self.memory);
+        let start = src as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        if self.src.swap(start, std::sync::atomic::Ordering::Relaxed) != start {
+            last.asked = 0;
+            last.hash = None;
+            last.partial = None;
+        }
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -629,7 +647,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::copy_mapped(read.as_mut_ptr(), src, size, false);
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -675,7 +693,7 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
-        if !committed(self.memory, size) {
+        if !committed(src, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
@@ -691,7 +709,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::copy_mapped(read.as_mut_ptr(), src, size, false);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -711,7 +729,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return with_title(src, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -727,7 +745,7 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        let tiled = unsafe { std::slice::from_raw_parts(src, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -749,8 +767,9 @@ impl Staging {
     /// Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        let src = source_address(self.memory);
         let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+            if !crate::host::read_into(src, read) {
                 return false;
             }
             let hash = blake3::hash(read);
@@ -826,7 +845,8 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    let src = s.src.load(std::sync::atomic::Ordering::Relaxed) as *const u8;
+    Some((size as u64, committed(src, size)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -981,6 +1001,17 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// The address to read a title texture's bytes from: its GPU-only view's
+/// paired CPU view while nothing is mapped at the GPU address (the Bink
+/// video planes), else the address itself.
+fn source_address(memory: *const u8) -> *const u8 {
+    let at = memory as usize;
+    match crate::mirrors::source(at) {
+        Some(cpu) if !committed(memory, 1) => cpu as *const u8,
+        _ => memory,
+    }
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -989,6 +1020,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let src = source_address(memory);
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
         once!(
@@ -1046,6 +1078,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         bytes: total,
         memory,
+        src: std::sync::atomic::AtomicUsize::new(src as usize),
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
