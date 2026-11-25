@@ -1,9 +1,9 @@
-# Project Americas
+# Vader
 
 Runs the Xbox Series build of GTA VI natively on Windows, on NVIDIA
 graphics cards, from game files the user supplies.
 
-Project Americas fuses three lines of work into one tree:
+Vader fuses three lines of work into one tree:
 
 - [ztrx](https://github.com/Zettrox/ztrx) by ZETTROX: the NVIDIA-tuned
   runtime, the most stable public build at the time of writing.
