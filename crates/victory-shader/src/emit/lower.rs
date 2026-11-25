@@ -1408,8 +1408,7 @@ impl<'a> Lower<'a> {
             // every console wave in the group, past everything else's LDS.
             // Addressed by the console thread, so the two host waves of a
             // split console wave never hit the same slot, and a lane names
-            // its own half. (The zero-initialized `tmp` of the ISA's
-            // ds_permute_b32; see its lowering in `ds`.)
+            // its own half. (See the lowering of ds_permute_b32 in `ds`.)
             if insts().any(|i| i.name() == "ds_permute_b32") {
                 scatter = Some(s.lds_dwords);
                 let group = cs.threads.iter().product::<u32>();
@@ -4478,11 +4477,14 @@ impl<'a> Lower<'a> {
         if name == "ds_permute_b32" {
             // A scatter: each lane in EXEC gives its data register to the
             // lane its address plus the offset names in dwords, within the
-            // calling lane's 32-lane half. An active lane that no lane names
-            // reads zero. The lowering zeroes the calling lane's slot of a
-            // scratch, runs a group barrier, has each lane in EXEC write the
-            // slot its address names, runs another barrier, and reads the
-            // calling lane's slot. A barrier needs every lane: in a block
+            // calling lane's 32-lane half. Of several lanes that name one
+            // lane, the highest wins (measured on an RDNA2 card by another
+            // project). An active lane that no lane names reads zero. The
+            // lowering zeroes the calling lane's slot of a scratch, runs a
+            // group barrier, has each lane in EXEC raise the slot its
+            // address names to its own lane number plus one, runs another
+            // barrier, and reads the data register of the lane the calling
+            // lane's slot holds. A barrier needs every lane: in a block
             // some lanes leave, this refuses (a wave-wide structuring of the
             // block would open it).
             // shortcut: the barriers are the group's. In a group of several
@@ -4524,12 +4526,26 @@ impl<'a> Lower<'a> {
             let z = self.s.m.i32(0);
             self.s.m.store(c, mine, z);
             self.group_sync(self.cur);
-            // Only the lanes in EXEC give their data, as on the console.
+            // The sender's lane in its half, plus one (zero: no sender).
+            // Only the lanes in EXEC send, as on the console.
+            let lane = self.s.m.bin(c, Bin::And, thread, k31);
+            let one = self.s.m.i32(1);
+            let sender = self.s.m.bin(c, Bin::Add, lane, one);
             let at = self.begin_guarded(guard);
-            self.s.m.store(self.cur, named, x);
+            self.s.m.atomic(self.cur, Rmw::UMax, named, sender);
             self.end_guarded(at, &[]);
             self.group_sync(self.cur);
-            let r = self.s.m.load(self.cur, mine);
+            let winner = self.s.m.load(self.cur, mine);
+            let sent = self.s.m.cmp(self.cur, pred::NE, winner, z);
+            // The winner's host lane: this lane's half, the winner's lane. A
+            // lane with no sender reads itself, and takes zero instead.
+            let own = self.lane_index();
+            let host_half = self.s.m.bin(self.cur, Bin::And, own, not31);
+            let from = self.s.m.bin(self.cur, Bin::Sub, winner, one);
+            let from = self.s.m.bin(self.cur, Bin::Or, host_half, from);
+            let from = self.s.m.select(self.cur, sent, from, own);
+            let r = self.read_lane(x, from);
+            let r = self.s.m.select(self.cur, sent, r, z);
             let reg = dst_reg.ok_or("a scatter result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());

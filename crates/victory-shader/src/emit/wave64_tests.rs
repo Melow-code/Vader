@@ -509,6 +509,52 @@ fn a_scatter_permute_gives_each_named_lane_the_senders_value() {
     }
 }
 
+/// Every lane of each half names lane 3, so the lanes collide: lane 3 reads the data of the
+/// highest sending lane, 31, and then 15 with only the lanes below 16 in EXEC. The other
+/// lanes in EXEC read zero and the lanes outside keep their v1. (The highest-lane rule is
+/// what another project measured on an RDNA2 card.)
+#[test]
+fn a_scatter_permute_collision_keeps_the_highest_sending_lane() {
+    for (wave64, threads) in [(false, 32u32), (false, 64), (true, 64), (true, 128)] {
+        let restore_exec = if wave64 { 0xBEFE_04C1 } else { 0xBEFE_03C1 };
+        let mut words = vec![
+            0x340C_0082, // v_lshlrev_b32 v6, 2, v0: where this thread stores
+            0x4A04_00FF,
+            0x0000_0100, // v_add_nc_u32 v2, 0x100, v0: the data
+            0x7E0E_028C, // v_mov_b32 v7, 12: every lane names lane 3
+            0x3608_009F, // v_and_b32 v4, 31, v0
+            0xDAC8_0000,
+            0x0100_0207, // ds_permute_b32 v1, v7, v2
+        ];
+        words.extend(store_at_v6(1, 0));
+        words.extend([
+            0x7DA8_0890, // v_cmpx_gt_u32 16, v4
+            0xDAC8_0000,
+            0x0100_0207, // ds_permute_b32 v1, v7, v2
+            restore_exec,
+        ]);
+        words.extend(store_at_v6(1, 4 * threads));
+        let native = native_of(&words, wave64, threads);
+        let Some(got) = dwords_on_the_card(&native, 2 * threads) else { return };
+        for t in 0..threads {
+            let (half, lane) = (t & !31, t & 31);
+            let first = if lane == 3 { 0x100 + half + 31 } else { 0 };
+            assert_eq!(got[t as usize], first, "wave64 {wave64}, {threads} threads: thread {t}, all lanes");
+            let second = match lane {
+                16.. => first,
+                3 => 0x100 + half + 15,
+                _ => 0,
+            };
+            assert_eq!(
+                got[(threads + t) as usize],
+                second,
+                "wave64 {wave64}, {threads} threads: thread {t}, the lanes below 16"
+            );
+        }
+        eprintln!("ran on the hardware device: the collision, wave64 {wave64}, {threads} threads");
+    }
+}
+
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
