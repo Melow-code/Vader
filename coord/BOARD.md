@@ -12,7 +12,8 @@ to `coord/archive/`. Statuses: queued, in progress, blocked, done, void.
 | T5 | T5-ambient-light.md | Port the ambient-light stand-in (source: VItoriaBr, fork-based NVIDIA) | queued |
 | T6 | T6-vram-envelope.md | Hold the 6 GB VRAM envelope (budgets, levels-on-demand test) | queued |
 | T7 | T7-scarlettport-diff.md | Extract portable fixes from ScarlettPort (stand-in lighting, tile-grid fix) | done (record in archive/; port candidates ranked) |
-| T8 | T8-dexnom-textures.md | Port DexNom sparse-texture and remap-notification fixes | top priority: range-scoped remap pins (watch.rs) kill the 1,397 ms texture-refresh wait |
+| T8 | T8-dexnom-textures.md | Port DexNom sparse-texture and remap-notification fixes | done (merged 7a11e42: range pins + full-rescan fallback; xmem extent = T15) |
+| T15 | T15-remap-extent.md | xmem passes the remap extent so remaps wait only overlapping readers | in progress (writer) |
 | T9 | T9-remapped-cap.md | Raise the lost-texture-notification cap 1<<15 → 1<<18 (ScarlettPort #1) | queued |
 | T10 | archive/T10-victory-perf-diff.md | Diff vitutu1/victory-perf against our tree | done (record archived; ranked port list) |
 | T11 | T11-texture-budget.md | Texture upload budget 192 MB/250 ms → 48 MB/10 ms (victory-perf #1) | done (merged c1cb20b, gate green, reviewer APPROVE) |
