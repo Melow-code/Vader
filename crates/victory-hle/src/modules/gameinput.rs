@@ -132,10 +132,8 @@ fn fallback(keys: &[KeyState]) -> PadState {
         right_trigger: on(b'C'),
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        // The right stick also follows the arrows, beside the dpad bits
-        // (Pedro's request: camera on the arrows).
-        right_x: on(b'L') - on(b'J') + on(0x27) - on(0x25),
-        right_y: on(b'I') - on(b'K') + on(0x26) - on(0x28),
+        right_x: on(b'L') - on(b'J'),
+        right_y: on(b'I') - on(b'K'),
     }
 }
 
