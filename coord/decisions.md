@@ -29,3 +29,8 @@ Append-only. Date, decision, why.
 - **2026-11-25 · D8 · Measure before porting.** Every frame-rate change is
   validated against the baseline on a fixed scene (docs/PLAN.md), one
   switch at a time.
+- **2026-11-25 · D9 · ScarlettPort is a patch mine, not a base.** Its
+  ranked port candidates are recorded in coord/archive/T7-...; the first
+  port is the notification-cap raise (T9), the DirectStorage/partial-mip
+  and pipeline-validity work follow. Their launcher and profiler are not
+  portable as-is.

@@ -11,8 +11,9 @@ to `coord/archive/`. Statuses: queued, in progress, blocked, done, void.
 | T4 | T4-switches.md | Validate the upstream frame-rate switches one by one against the baseline | queued |
 | T5 | T5-ambient-light.md | Port the ambient-light stand-in (source: VItoriaBr, fork-based NVIDIA) | queued |
 | T6 | T6-vram-envelope.md | Hold the 6 GB VRAM envelope (budgets, levels-on-demand test) | queued |
-| T7 | T7-scarlettport-diff.md | Extract portable fixes from ScarlettPort (stand-in lighting, tile-grid fix) | in progress (diff agent running) |
+| T7 | T7-scarlettport-diff.md | Extract portable fixes from ScarlettPort (stand-in lighting, tile-grid fix) | done (record in archive/; port candidates ranked) |
 | T8 | T8-dexnom-textures.md | Port DexNom sparse-texture and remap-notification fixes | queued |
+| T9 | T9-remapped-cap.md | Raise the lost-texture-notification cap 1<<15 → 1<<18 (ScarlettPort #1) | queued |
 
 Backlog (from the research agents, not yet briefed): integer-blend PSO
 fixes, depth bounds, static sampler across uniform branch, GPU dirty-page
