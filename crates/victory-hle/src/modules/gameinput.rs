@@ -618,14 +618,6 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    if kind & GAMEPAD_KIND != 0 {
-        tracing::info!(
-            kind = format_args!("{kind:#x}"),
-            device = ?hub.index(device),
-            sequence = found.map(|r| r.sequence),
-            "pad reading polled"
-        );
-    }
     hand(out, found)
 }
 
