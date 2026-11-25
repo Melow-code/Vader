@@ -15,7 +15,7 @@ to `coord/archive/`. Statuses: queued, in progress, blocked, done, void.
 | T8 | T8-dexnom-textures.md | Port DexNom sparse-texture and remap-notification fixes | top priority: range-scoped remap pins (watch.rs) kill the 1,397 ms texture-refresh wait |
 | T9 | T9-remapped-cap.md | Raise the lost-texture-notification cap 1<<15 → 1<<18 (ScarlettPort #1) | queued |
 | T10 | archive/T10-victory-perf-diff.md | Diff vitutu1/victory-perf against our tree | done (record archived; ranked port list) |
-| T11 | T11-texture-budget.md | Texture upload budget 192 MB/250 ms → 48 MB/10 ms (victory-perf #1) | in progress (writer) |
+| T11 | T11-texture-budget.md | Texture upload budget 192 MB/250 ms → 48 MB/10 ms (victory-perf #1) | done (merged c1cb20b, gate green, reviewer APPROVE) |
 | T12 | T12-heap-buckets.md | heap_buffers 64-bucket smoothing + submit-path O(N²) removals | queued |
 | T13 | T13-standins.md | Lighting stand-ins (ambient/shadowmask/exposure) behind switches | queued |
 | T14 | T14-precompile.md | Ahead-of-time compute PSO precompile | queued |
