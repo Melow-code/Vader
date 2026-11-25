@@ -6808,6 +6808,31 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_mad_i64_i32" => {
+                // a * b + c signed: S0.i32 * S1.i32 as a signed 64-bit
+                // product, plus S2.i64; the 64-bit result. The carry-out
+                // mask is not lowered: a program that reads it stops.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.src64(inst, 2)?;
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let a = self.s.m.cast(c, Cast::SExt, a, i64t);
+                let b = self.s.m.cast(c, Cast::SExt, b, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, b);
+                let r = self.s.m.bin(c, Bin::Add, product, x);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -7652,6 +7677,15 @@ impl<'a> Lower<'a> {
             }
             Operand::Const(k @ 128..=208) => {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
+                Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
+            }
+            Operand::Literal(x) if inst.name() == "v_mad_i64_i32" && k == 2 => {
+                // v_mad_i64_i32's addend (src2) is a signed 64-bit operand
+                // (FMT_NUM_I64 in AMD's machine-readable RDNA 2 ISA), so its
+                // 32-bit literal sign-extends, like the inline constants
+                // above. The name ends in _i32 (the multiplied inputs), so
+                // the guard is on the operand. v_mad_u64_u32 keeps the
+                // zero-extending arm.
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {
@@ -11892,5 +11926,42 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn v_mad_i64_i32_with_a_literal_addend_lowers() {
+        // v_mad_i64_i32 v[0:1], vcc, 0, 0, lit(-100); ds_write_b32 [v0], v1
+        // so the result is read (an unread one is not lowered). VOP3B:
+        // opcode 0x177, vdst=0, sdst=0x6A (VCC; nothing reads the carry-out).
+        // The GPU test in `valu_tests` checks the value.
+        let body = [
+            0xD577_6A00,
+            0x03FD_0080,
+            0xFFFF_FF9C,
+            0xD834_0000,
+            0x0000_0100,
+            S_ENDPGM,
+        ];
+        lowers(&body, 1 << 15).unwrap();
+    }
+
+    #[test]
+    fn a_read_of_the_carry_of_v_mad_i64_i32_is_refused() {
+        // v_mad_i64_i32 v[0:1], vcc, 0, 0, 0; v_cndmask_b32 v2, v0, v1, vcc;
+        // ds_write_b32 [v0], v2 so the result is read. The carry-out is not
+        // lowered: it must stop the program, not give a value.
+        let body = [
+            0xD577_6A00,
+            0x0201_0080,
+            0x0204_0300,
+            0xD834_0000,
+            0x0000_0200,
+            S_ENDPGM,
+        ];
+        let e = match lowers(&body, 1 << 15) {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("a read of the carry lowered"),
+        };
+        assert!(e.contains("a lane mask from a carry is not supported"), "{e}");
     }
 }
