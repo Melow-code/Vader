@@ -358,21 +358,22 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
 /// default).
 ///
-/// A texture whose memory is all mapped is read in place, under a lock
-/// the runtime takes alone while it changes a mapping
-/// (`crate::watch::title_memory_reading`), so that no page goes away under
-/// the read. While the world streams in the runtime remaps all the time,
-/// and each of the frame's 150-360 refreshes waited for it: runs 99-101
-/// have 4, 15 and 16 frame lines with over 300 ms of "textures", up to
-/// 3,708 ms, and on every one of them the wait for this lock is the whole
-/// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
-/// ms, the texture's own lock 0).
+/// A texture whose memory is all mapped is read in place, under a pin of
+/// its own range that a change of mapping overlapping it waits for
+/// (`crate::watch::title_memory_reading_range`), so that no page goes away
+/// under the read. While the world streams in the runtime remaps all the
+/// time, and each of the frame's 150-360 refreshes waited for it: runs
+/// 99-101 have 4, 15 and 16 frame lines with over 300 ms of "textures",
+/// up to 3,708 ms, and on every one of them the wait for this lock is the
+/// whole of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch
+/// askings 3-12 ms, the texture's own lock 0).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
+/// With the switch the refresh asks for the pin without waiting. If a
+/// change of its range is under way, the texture is read through the
+/// kernel instead, which needs no pin: it fails if a page is not there,
+/// and then the texture is left as it is and read at its next refresh, a
+/// frame later. A read through the kernel costs about 0.6 ms a megabyte
+/// against 0.3 in place.
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
@@ -389,8 +390,8 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
 /// refreshing the same texture), asking the write watch and the guards,
-/// waiting for title memory to hold still (the lock the runtime takes
-/// alone while it remaps, `crate::watch::title_memory_reading`), and the
+/// waiting for title memory to hold still (a remap that meets the
+/// texture's range; `crate::watch::title_memory_reading_range`), and the
 /// refreshes in all.
 ///
 /// While the world streams in, the frame line's "textures" is seconds a
@@ -1002,6 +1003,7 @@ impl Staging {
         // was learnt of it is forgotten.
         let src = source_address(self.memory);
         let start = src as usize;
+        let end = start.saturating_add(size);
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         if self.src.swap(start, std::sync::atomic::Ordering::Relaxed) != start {
@@ -1009,7 +1011,7 @@ impl Staging {
             last.hash = None;
             last.partial = None;
         }
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, end, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1036,7 +1038,7 @@ impl Staging {
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, end, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -1046,22 +1048,27 @@ impl Staging {
                 return 0;
             }
         }
-        // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
+        // From here on the texture's memory may be read in place. Its own
+        // range, and only that, is pinned until the read is done: the
+        // runtime changes what title memory shows only with a pin whose
+        // range it overlaps waiting, so what `committed` finds mapped
+        // stays mapped (see `crate::watch::title_memory_reading_range`;
+        // without it a page went between the asking and the read in runs
+        // 71 and 74). While the world streams in the runtime remaps all
+        // the time, and each of the frame's 150-360 refreshes waited out
+        // every remap of the frame (1,397.7 ms of one 1,690 ms frame was
+        // this wait alone, baseline-02); a refresh now waits only for a
+        // remap that meets its range.
         let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
+            // Not waited for: while the runtime remaps this range the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now_range(start..end) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start..end))
         };
         if !committed(src, size) {
             // Partly mapped: a streamed texture with only some mips' pages
