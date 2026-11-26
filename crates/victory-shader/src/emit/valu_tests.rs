@@ -7,6 +7,7 @@
 //! float atomics `ds_min_f32`/`ds_max_f32`.
 
 use super::host::{Dispatch, Host, Root, View};
+use super::lower::tests::lowers;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -1664,4 +1665,40 @@ fn mad_64bit_literal_addends_match_signed_and_unsigned_arithmetic() {
             });
         }
     }
+}
+
+#[test]
+fn v_mad_i64_i32_with_a_literal_addend_lowers() {
+    // v_mad_i64_i32 v[0:1], vcc, 0, 0, lit(-100); ds_write_b32 [v0], v1 so the
+    // result is read (an unread one is not lowered). VOP3B: opcode 0x177,
+    // vdst=0, sdst=0x6A (VCC; nothing reads the carry-out).
+    let body = [
+        0xD577_6A00,
+        0x03FD_0080,
+        0xFFFF_FF9C,
+        0xD834_0000,
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    lowers(&body, 1 << 15).unwrap();
+}
+
+#[test]
+fn a_read_of_the_carry_of_v_mad_i64_i32_is_refused() {
+    // v_mad_i64_i32 v[0:1], vcc, 0, 0, 0; v_cndmask_b32 v2, v0, v1, vcc;
+    // ds_write_b32 [v0], v2 so the result is read. The carry-out is not
+    // lowered: it must stop the program, not give a value.
+    let body = [
+        0xD577_6A00,
+        0x0201_0080,
+        0x0204_0300,
+        0xD834_0000,
+        0x0000_0200,
+        S_ENDPGM,
+    ];
+    let e = match lowers(&body, 1 << 15) {
+        Err(e) => e.to_string(),
+        Ok(()) => panic!("a read of the carry lowered"),
+    };
+    assert!(e.contains("a lane mask from a carry is not supported"), "{e}");
 }

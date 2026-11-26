@@ -11416,7 +11416,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::emit) mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -11548,7 +11548,7 @@ mod tests {
     }
 
     /// Whether a synthetic compute program translates with these input registers.
-    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    pub(in crate::emit) fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -12018,83 +12018,5 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
-    }
-
-    #[test]
-    fn v_mad_i64_i32_with_a_literal_addend_lowers() {
-        // v_mad_i64_i32 v[0:1], vcc, 0, 0, lit(-100); ds_write_b32 [v0], v1
-        // so the result is read (an unread one is not lowered). VOP3B:
-        // opcode 0x177, vdst=0, sdst=0x6A (VCC; nothing reads the carry-out).
-        // The GPU test in `valu_tests` checks the value.
-        let body = [
-            0xD577_6A00,
-            0x03FD_0080,
-            0xFFFF_FF9C,
-            0xD834_0000,
-            0x0000_0100,
-            S_ENDPGM,
-        ];
-        lowers(&body, 1 << 15).unwrap();
-    }
-
-    #[test]
-    fn a_read_of_the_carry_of_v_mad_i64_i32_is_refused() {
-        // v_mad_i64_i32 v[0:1], vcc, 0, 0, 0; v_cndmask_b32 v2, v0, v1, vcc;
-        // ds_write_b32 [v0], v2 so the result is read. The carry-out is not
-        // lowered: it must stop the program, not give a value.
-        let body = [
-            0xD577_6A00,
-            0x0201_0080,
-            0x0204_0300,
-            0xD834_0000,
-            0x0000_0200,
-            S_ENDPGM,
-        ];
-        let e = match lowers(&body, 1 << 15) {
-            Err(e) => e.to_string(),
-            Ok(()) => panic!("a read of the carry lowered"),
-        };
-        assert!(e.contains("a lane mask from a carry is not supported"), "{e}");
-    }
-
-    #[test]
-    fn a_scatter_permute_writes_the_lane_its_address_names() {
-        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2; the result stored
-        // back to LDS so it is read.
-        lowers(
-            &[
-                0x7E04_028B,
-                0xDAC8_0000,
-                0x0100_0200,
-                0xD834_0000, // ds_write_b32 [v0], v1
-                0x0000_0100,
-                S_ENDPGM,
-            ],
-            1 << 15,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn a_scatter_permute_in_a_branch_is_refused() {
-        // A per-lane branch (each lane takes s_cbranch_vccz on its own
-        // compare bit) around the scatter: some lanes skip the block, and
-        // the scatter's barriers need every lane. The stored result makes
-        // the refusal reach the program.
-        let body = [
-            0x7E04_028B, // v_mov_b32 v2, 11
-            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
-            0xBF86_0002, // s_cbranch_vccz 2
-            0xDAC8_0000, // ds_permute_b32 v1, v0, v2
-            0x0100_0200,
-            0xD834_0000, // ds_write_b32 [v0], v1
-            0x0000_0100,
-            S_ENDPGM,
-        ];
-        let e = match lowers(&body, 1 << 15) {
-            Err(e) => e.to_string(),
-            Ok(()) => panic!("a scatter permute in a branch lowered"),
-        };
-        assert!(e.contains("a scatter permute"), "{e}");
     }
 }

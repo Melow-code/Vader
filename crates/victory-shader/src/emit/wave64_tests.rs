@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use super::host::{Dispatch, Host, Root, View};
+use super::lower::tests::lowers;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -415,6 +416,44 @@ fn a_wave_or_inside(skip: u32, name: &str) {
         assert_eq!(out[0][0], expected, "{name}: {below} threads in the branch");
     }
     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
+}
+
+#[test]
+fn a_scatter_permute_writes_the_lane_its_address_names() {
+    // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2; the result stored back to
+    // LDS so it is read.
+    let body = [
+        0x7E04_028B,
+        0xDAC8_0000,
+        0x0100_0200,
+        0xD834_0000, // ds_write_b32 [v0], v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    lowers(&body, 1 << 15).unwrap();
+}
+
+#[test]
+fn a_scatter_permute_in_a_branch_is_refused() {
+    // A per-lane branch (each lane takes s_cbranch_vccz on its own compare
+    // bit) around the scatter: some lanes skip the block, and the scatter's
+    // barriers need every lane. The stored result makes the refusal reach the
+    // program.
+    let body = [
+        0x7E04_028B, // v_mov_b32 v2, 11
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBF86_0002, // s_cbranch_vccz 2
+        0xDAC8_0000, // ds_permute_b32 v1, v0, v2
+        0x0100_0200,
+        0xD834_0000, // ds_write_b32 [v0], v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let e = match lowers(&body, 1 << 15) {
+        Err(e) => e.to_string(),
+        Ok(()) => panic!("a scatter permute in a branch lowered"),
+    };
+    assert!(e.contains("a scatter permute"), "{e}");
 }
 
 /// `buffer_store_dword vdata, v6, s[8:11], 0 offen offset:byte_off`.
