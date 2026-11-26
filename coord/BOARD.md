@@ -6,7 +6,7 @@ to `coord/archive/`. Statuses: queued, in progress, blocked, done, void.
 | Task | File | Goal (one line) | Status |
 |------|------|-----------------|--------|
 | T1 | T1-baseline.md | Capture the world-scene baseline (diag build, frame log + card meter) | done (bench/baseline-02.md: CPU-bound on remap/texture sync, card 86 % idle) |
-| T2 | T2-shader-prs.md | Port the shader lowering fixes (mad_i64 literal, neg 16-bit/packed, ds_permute scatter; cache max-wave already upstream) | in progress |
+| T2 | T2-shader-prs.md | Port the shader lowering fixes (mad_i64 literal, neg 16-bit/packed, ds_permute scatter; cache max-wave already upstream) | in progress (mad_i64 + ds_permute in review; both neg fixes left out on evidence, lead decides, see record) |
 | T3 | T3-bink-check.md | Confirm the Bink video plane fix in game | done (video plays; credits planes partially black, see record) |
 | T4 | T4-switches.md | Validate the upstream frame-rate switches one by one against the baseline | queued |
 | T5 | T5-ambient-light.md | Port the ambient-light stand-in (source: VItoriaBr, fork-based NVIDIA) | queued |
