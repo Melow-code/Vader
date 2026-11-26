@@ -265,6 +265,9 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// The first dword of the scatter's scratch, a dword per lane of every console wave in the
+    /// group (`ds_permute_b32`), allocated past the program's LDS.
+    scatter: Option<u32>,
     wave_base: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
@@ -1272,6 +1275,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // the scatter's scratch base (`ds_permute_b32`)
+        let mut scatter: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1398,6 +1403,16 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+            }
+            // The scatter's scratch (`ds_permute_b32`): a dword per lane of
+            // every console wave in the group, past everything else's LDS.
+            // Addressed by the console thread, so the two host waves of a
+            // split console wave never hit the same slot, and a lane names
+            // its own half. (See the lowering of ds_permute_b32 in `ds`.)
+            if insts().any(|i| i.name() == "ds_permute_b32") {
+                scatter = Some(s.lds_dwords);
+                let group = cs.threads.iter().product::<u32>();
+                s.lds_dwords += 64 * group.div_ceil(64);
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1558,6 +1573,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            scatter,
             wave_base: None,
             flat: None,
             no_barrier,
@@ -4458,6 +4474,82 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_permute_b32" {
+            // A scatter: each lane in EXEC gives its data register to the
+            // lane its address plus the offset names in dwords, within the
+            // calling lane's 32-lane half. Of several lanes that name one
+            // lane, the highest wins (measured on an RDNA2 card by another
+            // project). An active lane that no lane names reads zero. The
+            // lowering zeroes the calling lane's slot of a scratch, runs a
+            // group barrier, has each lane in EXEC raise the slot its
+            // address names to its own lane number plus one, runs another
+            // barrier, and reads the data register of the lane the calling
+            // lane's slot holds. A barrier needs every lane: in a block
+            // some lanes leave, this refuses (a wave-wide structuring of the
+            // block would open it).
+            // shortcut: the barriers are the group's. In a group of several
+            // console waves, a branch on a scalar that only some waves take
+            // around this instruction would leave the others waiting.
+            self.cross_lane(false)?;
+            let every = if self.exchange.is_some() {
+                self.all_lanes(self.cur_ir)
+            } else {
+                all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
+            };
+            if !every {
+                need(self.cur_ir);
+                return Err("a scatter permute where not every lane runs");
+            }
+            let scatter = self.scatter.ok_or("a scatter permute outside compute")?;
+            let x = self.vgprs(inst, data.first().ok_or("a scatter source")?, 1)?[0];
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a scatter address")?, 1)?[0];
+            let o = self.s.m.i32(offset);
+            let bytes = self.s.m.bin(c, Bin::Add, a, o);
+            let two = self.s.m.i32(2);
+            let idx = self.s.m.bin(c, Bin::LShr, bytes, two);
+            let k31 = self.s.m.i32(31);
+            let idx = self.s.m.bin(c, Bin::And, idx, k31);
+            // The scratch is addressed by the console thread: every console
+            // wave of the group owns 64 consecutive dwords, so the two host
+            // waves of a split console wave never hit the same slot, and a
+            // lane names its own half.
+            let thread = self.console_thread();
+            let not31 = self.s.m.i32(!31);
+            let half = self.s.m.bin(c, Bin::And, thread, not31);
+            let named = self.s.m.bin(c, Bin::Or, half, idx);
+            let lds = self.s.lds();
+            let k = self.s.m.i32(scatter);
+            let mine = self.s.m.bin(c, Bin::Add, k, thread);
+            let named = self.s.m.bin(c, Bin::Add, k, named);
+            let mine = self.s.m.element(c, lds, mine);
+            let named = self.s.m.element(c, lds, named);
+            let z = self.s.m.i32(0);
+            self.s.m.store(c, mine, z);
+            self.group_sync(self.cur);
+            // The sender's lane in its half, plus one (zero: no sender).
+            // Only the lanes in EXEC send, as on the console.
+            let lane = self.s.m.bin(c, Bin::And, thread, k31);
+            let one = self.s.m.i32(1);
+            let sender = self.s.m.bin(c, Bin::Add, lane, one);
+            let at = self.begin_guarded(guard);
+            self.s.m.atomic(self.cur, Rmw::UMax, named, sender);
+            self.end_guarded(at, &[]);
+            self.group_sync(self.cur);
+            let winner = self.s.m.load(self.cur, mine);
+            let sent = self.s.m.cmp(self.cur, pred::NE, winner, z);
+            // The winner's host lane: this lane's half, the winner's lane. A
+            // lane with no sender reads itself, and takes zero instead.
+            let own = self.lane_index();
+            let host_half = self.s.m.bin(self.cur, Bin::And, own, not31);
+            let from = self.s.m.bin(self.cur, Bin::Sub, winner, one);
+            let from = self.s.m.bin(self.cur, Bin::Or, host_half, from);
+            let from = self.s.m.select(self.cur, sent, from, own);
+            let r = self.read_lane(x, from);
+            let r = self.s.m.select(self.cur, sent, r, z);
+            let reg = dst_reg.ok_or("a scatter result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -6808,6 +6900,31 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_mad_i64_i32" => {
+                // a * b + c signed: S0.i32 * S1.i32 as a signed 64-bit
+                // product, plus S2.i64; the 64-bit result. The carry-out
+                // mask is not lowered: a program that reads it stops.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.src64(inst, 2)?;
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let a = self.s.m.cast(c, Cast::SExt, a, i64t);
+                let b = self.s.m.cast(c, Cast::SExt, b, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, b);
+                let r = self.s.m.bin(c, Bin::Add, product, x);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -7652,6 +7769,15 @@ impl<'a> Lower<'a> {
             }
             Operand::Const(k @ 128..=208) => {
                 let x = crate::resource::inline(k).ok_or("a special operand")?;
+                Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
+            }
+            Operand::Literal(x) if inst.name() == "v_mad_i64_i32" && k == 2 => {
+                // v_mad_i64_i32's addend (src2) is a signed 64-bit operand
+                // (FMT_NUM_I64 in AMD's machine-readable RDNA 2 ISA), so its
+                // 32-bit literal sign-extends, like the inline constants
+                // above. The name ends in _i32 (the multiplied inputs), so
+                // the guard is on the operand. v_mad_u64_u32 keeps the
+                // zero-extending arm.
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {
@@ -11290,7 +11416,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::emit) mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -11422,7 +11548,7 @@ mod tests {
     }
 
     /// Whether a synthetic compute program translates with these input registers.
-    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    pub(in crate::emit) fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,

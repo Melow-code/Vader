@@ -7,6 +7,7 @@
 //! float atomics `ds_min_f32`/`ds_max_f32`.
 
 use super::host::{Dispatch, Host, Root, View};
+use super::lower::tests::lowers;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -1621,4 +1622,83 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
+}
+
+/// `v_mad_i64_i32` (signed multiply and addend) and `v_mad_u64_u32` with a
+/// 32-bit literal addend whose sign bit is set: the signed instruction
+/// sign-extends the literal to 64 bits, the unsigned one zero-extends it.
+/// Both dwords of the 64-bit result are read back and compared with the CPU's
+/// arithmetic. It follows the first signed and unsigned readback test of
+/// steven-seagull27.
+#[test]
+fn mad_64bit_literal_addends_match_signed_and_unsigned_arithmetic() {
+    let cases: &[[u32; 4]] = &[
+        [0, 0, 0, 0],
+        [3, 0xFFFF_FFFB, 0, 0],
+        [0xFFFF_FFFD, 0xFFFF_FFFB, 0, 0],
+        [0x8000_0000, 0xFFFF_FFFF, 0, 0],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0],
+        [0x1234_5678, 0x0ABC_DEF0, 0, 0],
+    ];
+    for (op, literal, signed) in [
+        (0x177u16, 0xFFFF_FF9Cu32, true), // v_mad_i64_i32, addend -100
+        (0x177, 0x8000_0000, true),       // v_mad_i64_i32, addend i32::MIN
+        (0x176, 0xFFFF_FF9C, false),      // v_mad_u64_u32, zero-extended
+    ] {
+        for half in 0..2u8 {
+            // v_mad_{i64_i32,u64_u32} v[6:7], vcc, v1, v2, literal; then
+            // v_mov_b32 v0, v6 (low dword) or v7 (high dword).
+            let [w0, w1] = vop3(op, 6, vgpr(1), vgpr(2), 255);
+            let mov = vop1(0x001, 0, vgpr(6 + half));
+            let shader = build_valu_cs(&[w0 | 106 << 8, w1, literal, mov]);
+            run_cases(&shader, cases, |backend, _, [a, b, _, _], got| {
+                let want = if signed {
+                    (i64::from(a as i32) * i64::from(b as i32) + i64::from(literal as i32)) as u64
+                } else {
+                    u64::from(a) * u64::from(b) + u64::from(literal)
+                };
+                assert_eq!(
+                    got,
+                    (want >> (32 * half)) as u32,
+                    "{backend}: op {op:#x} lit {literal:#010x} on a={a:#010x}, b={b:#010x}: dword {half} of {want:#018x}",
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn v_mad_i64_i32_with_a_literal_addend_lowers() {
+    // v_mad_i64_i32 v[0:1], vcc, 0, 0, lit(-100); ds_write_b32 [v0], v1 so the
+    // result is read (an unread one is not lowered). VOP3B: opcode 0x177,
+    // vdst=0, sdst=0x6A (VCC; nothing reads the carry-out).
+    let body = [
+        0xD577_6A00,
+        0x03FD_0080,
+        0xFFFF_FF9C,
+        0xD834_0000,
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    lowers(&body, 1 << 15).unwrap();
+}
+
+#[test]
+fn a_read_of_the_carry_of_v_mad_i64_i32_is_refused() {
+    // v_mad_i64_i32 v[0:1], vcc, 0, 0, 0; v_cndmask_b32 v2, v0, v1, vcc;
+    // ds_write_b32 [v0], v2 so the result is read. The carry-out is not
+    // lowered: it must stop the program, not give a value.
+    let body = [
+        0xD577_6A00,
+        0x0201_0080,
+        0x0204_0300,
+        0xD834_0000,
+        0x0000_0200,
+        S_ENDPGM,
+    ];
+    let e = match lowers(&body, 1 << 15) {
+        Err(e) => e.to_string(),
+        Ok(()) => panic!("a read of the carry lowered"),
+    };
+    assert!(e.contains("a lane mask from a carry is not supported"), "{e}");
 }

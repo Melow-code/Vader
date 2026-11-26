@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use super::host::{Dispatch, Host, Root, View};
+use super::lower::tests::lowers;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -415,6 +416,182 @@ fn a_wave_or_inside(skip: u32, name: &str) {
         assert_eq!(out[0][0], expected, "{name}: {below} threads in the branch");
     }
     eprintln!("ran on the hardware device ({name}): the OR of both halves in every case");
+}
+
+#[test]
+fn a_scatter_permute_writes_the_lane_its_address_names() {
+    // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2; the result stored back to
+    // LDS so it is read.
+    let body = [
+        0x7E04_028B,
+        0xDAC8_0000,
+        0x0100_0200,
+        0xD834_0000, // ds_write_b32 [v0], v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    lowers(&body, 1 << 15).unwrap();
+}
+
+#[test]
+fn a_scatter_permute_in_a_branch_is_refused() {
+    // A per-lane branch (each lane takes s_cbranch_vccz on its own compare
+    // bit) around the scatter: some lanes skip the block, and the scatter's
+    // barriers need every lane. The stored result makes the refusal reach the
+    // program.
+    let body = [
+        0x7E04_028B, // v_mov_b32 v2, 11
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBF86_0002, // s_cbranch_vccz 2
+        0xDAC8_0000, // ds_permute_b32 v1, v0, v2
+        0x0100_0200,
+        0xD834_0000, // ds_write_b32 [v0], v1
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let e = match lowers(&body, 1 << 15) {
+        Err(e) => e.to_string(),
+        Ok(()) => panic!("a scatter permute in a branch lowered"),
+    };
+    assert!(e.contains("a scatter permute"), "{e}");
+}
+
+/// `buffer_store_dword vdata, v6, s[8:11], 0 offen offset:byte_off`.
+const fn store_at_v6(vdata: u32, byte_off: u32) -> [u32; 2] {
+    [0x38 << 26 | 0x1C << 18 | 1 << 12 | byte_off, 0x80 << 24 | 2 << 16 | vdata << 8 | 6]
+}
+
+/// Runs `native` (lowered for a host of 32-lane waves) once on the hardware device and gives
+/// `dwords` dwords of the UAV; None (and a line) without such a device.
+fn dwords_on_the_card(native: &NativeProgram, dwords: u32) -> Option<Vec<u32>> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("compute_pipeline failed: {e}"));
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let mut out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out.swap_remove(0))
+}
+
+/// Two `ds_permute_b32` in a row, each lane's data its thread index plus 0x100. The first, with
+/// all lanes, reverses the lanes of each half and shifts them by one with `offset:4`. The
+/// second runs with the lanes below 16 of each half: they give to the even lanes. The other
+/// lanes name the odd lanes, but they are not in EXEC, so the odd lanes read zero (not what
+/// the first permute left), and the other lanes keep their v1. Console waves of 32 (one, then
+/// two in a group) and console waves of 64 run as two host waves of 32 (one, then two).
+#[test]
+fn a_scatter_permute_gives_each_named_lane_the_senders_value() {
+    for (wave64, threads) in [(false, 32u32), (false, 64), (true, 64), (true, 128)] {
+        let restore_exec = if wave64 { 0xBEFE_04C1 } else { 0xBEFE_03C1 };
+        let mut words = vec![
+            0x340C_0082, // v_lshlrev_b32 v6, 2, v0: where this thread stores
+            0x4A04_00FF,
+            0x0000_0100, // v_add_nc_u32 v2, 0x100, v0: the data
+            0x3A06_009F, // v_xor_b32 v3, 31, v0
+            0x3406_0682, // v_lshlrev_b32 v3, 2, v3: the first addresses
+            0x2C0A_0084, // v_lshrrev_b32 v5, 4, v0
+            0x360A_0A81, // v_and_b32 v5, 1, v5
+            0x3408_0081, // v_lshlrev_b32 v4, 1, v0
+            0x380A_0B04, // v_or_b32 v5, v4, v5
+            0x340A_0A82, // v_lshlrev_b32 v5, 2, v5: the second addresses
+            0x3608_009F, // v_and_b32 v4, 31, v0
+            0xDAC8_0004,
+            0x0100_0203, // ds_permute_b32 v1, v3, v2 offset:4
+        ];
+        words.extend(store_at_v6(1, 0));
+        words.extend([
+            0x7DA8_0890, // v_cmpx_gt_u32 16, v4
+            0xDAC8_0000,
+            0x0100_0205, // ds_permute_b32 v1, v5, v2
+            restore_exec,
+        ]);
+        words.extend(store_at_v6(1, 4 * threads));
+        let native = native_of(&words, wave64, threads);
+        let Some(got) = dwords_on_the_card(&native, 2 * threads) else { return };
+        for t in 0..threads {
+            let (half, lane) = (t & !31, t & 31);
+            let first = 0x100 + half + ((32 - lane) & 31);
+            assert_eq!(got[t as usize], first, "wave64 {wave64}, {threads} threads: thread {t}, all lanes");
+            let second = match lane {
+                16.. => first,
+                _ if lane % 2 == 0 => 0x100 + half + lane / 2,
+                _ => 0,
+            };
+            assert_eq!(
+                got[(threads + t) as usize],
+                second,
+                "wave64 {wave64}, {threads} threads: thread {t}, the lanes below 16"
+            );
+        }
+        eprintln!("ran on the hardware device: the scatter, wave64 {wave64}, {threads} threads");
+    }
+}
+
+/// Every lane of each half names lane 3, so the lanes collide: lane 3 reads the data of the
+/// highest sending lane, 31, and then 15 with only the lanes below 16 in EXEC. The other
+/// lanes in EXEC read zero and the lanes outside keep their v1. (The highest-lane rule is
+/// what another project measured on an RDNA2 card.)
+#[test]
+fn a_scatter_permute_collision_keeps_the_highest_sending_lane() {
+    for (wave64, threads) in [(false, 32u32), (false, 64), (true, 64), (true, 128)] {
+        let restore_exec = if wave64 { 0xBEFE_04C1 } else { 0xBEFE_03C1 };
+        let mut words = vec![
+            0x340C_0082, // v_lshlrev_b32 v6, 2, v0: where this thread stores
+            0x4A04_00FF,
+            0x0000_0100, // v_add_nc_u32 v2, 0x100, v0: the data
+            0x7E0E_028C, // v_mov_b32 v7, 12: every lane names lane 3
+            0x3608_009F, // v_and_b32 v4, 31, v0
+            0xDAC8_0000,
+            0x0100_0207, // ds_permute_b32 v1, v7, v2
+        ];
+        words.extend(store_at_v6(1, 0));
+        words.extend([
+            0x7DA8_0890, // v_cmpx_gt_u32 16, v4
+            0xDAC8_0000,
+            0x0100_0207, // ds_permute_b32 v1, v7, v2
+            restore_exec,
+        ]);
+        words.extend(store_at_v6(1, 4 * threads));
+        let native = native_of(&words, wave64, threads);
+        let Some(got) = dwords_on_the_card(&native, 2 * threads) else { return };
+        for t in 0..threads {
+            let (half, lane) = (t & !31, t & 31);
+            let first = if lane == 3 { 0x100 + half + 31 } else { 0 };
+            assert_eq!(got[t as usize], first, "wave64 {wave64}, {threads} threads: thread {t}, all lanes");
+            let second = match lane {
+                16.. => first,
+                3 => 0x100 + half + 15,
+                _ => 0,
+            };
+            assert_eq!(
+                got[(threads + t) as usize],
+                second,
+                "wave64 {wave64}, {threads} threads: thread {t}, the lanes below 16"
+            );
+        }
+        eprintln!("ran on the hardware device: the collision, wave64 {wave64}, {threads} threads");
+    }
 }
 
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
